@@ -4,6 +4,7 @@
 
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/kobject.h>
 #include <linux/err.h>
 #include <linux/of.h>
 #include <linux/sys_soc.h>
@@ -30,30 +31,46 @@ static struct project_info_v2 *project_info_desc_v2 = NULL;
 static struct dump_info *dp_info;
 
 static struct kobject *component_info;
-static ssize_t project_info_get(struct device *dev,
-    struct device_attribute *attr, char *buf);
-static ssize_t component_info_get(struct device *dev,
-    struct device_attribute *attr, char *buf);
+static ssize_t project_info_get(struct kobject *kobj,
+    struct kobj_attribute *attr, char *buf);
+static ssize_t component_info_get(struct kobject *kobj,
+    struct kobj_attribute *attr, char *buf);
 static int op_aboard_read_gpio(void);
 
-static DEVICE_ATTR(project_name, 0444, project_info_get, NULL);
-static DEVICE_ATTR(hw_id, 0444, project_info_get, NULL);
-static DEVICE_ATTR(rf_id_v1, 0444, project_info_get, NULL);
-static DEVICE_ATTR(rf_id_v2, 0444, project_info_get, NULL);
-static DEVICE_ATTR(rf_id_v3, 0444, project_info_get, NULL);
-static DEVICE_ATTR(modem, 0444, project_info_get, NULL);
-static DEVICE_ATTR(operator_no, 0444, project_info_get, NULL);
-static DEVICE_ATTR(ddr_manufacture_info, 0444, project_info_get, NULL);
-static DEVICE_ATTR(ddr_row, 0444, project_info_get, NULL);
-static DEVICE_ATTR(ddr_column, 0444, project_info_get, NULL);
-static DEVICE_ATTR(ddr_fw_version, 0444, project_info_get, NULL);
-static DEVICE_ATTR(ddr_reserve_info, 0444, project_info_get, NULL);
-static DEVICE_ATTR(secboot_status, 0444, project_info_get, NULL);
-static DEVICE_ATTR(platform_id, 0444, project_info_get, NULL);
-static DEVICE_ATTR(serialno, 0444, project_info_get, NULL);
-static DEVICE_ATTR(feature_id, 0444, project_info_get, NULL);
-static DEVICE_ATTR(aboard_id, 0444, project_info_get, NULL);
-
+static struct kobj_attribute dev_attr_project_name =
+    __ATTR(project_name, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_hw_id =
+    __ATTR(hw_id, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_rf_id_v1 =
+    __ATTR(rf_id_v1, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_rf_id_v2 =
+    __ATTR(rf_id_v2, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_rf_id_v3 =
+    __ATTR(rf_id_v3, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_modem =
+    __ATTR(modem, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_operator_no =
+    __ATTR(operator_no, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_ddr_manufacture_info =
+    __ATTR(ddr_manufacture_info, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_ddr_row =
+    __ATTR(ddr_row, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_ddr_column =
+    __ATTR(ddr_column, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_ddr_fw_version =
+    __ATTR(ddr_fw_version, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_ddr_reserve_info =
+    __ATTR(ddr_reserve_info, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_secboot_status =
+    __ATTR(secboot_status, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_platform_id =
+    __ATTR(platform_id, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_serialno =
+    __ATTR(serialno, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_feature_id =
+    __ATTR(feature_id, 0444, project_info_get, NULL);
+static struct kobj_attribute dev_attr_aboard_id =
+    __ATTR(aboard_id, 0444, project_info_get, NULL);
 #define GET_PROJECT_INFO(member) (project_info_desc_v2 ? project_info_desc_v2->member : project_info_desc_v1->member)
 #define SET_PROJECT_INFO(member, value) \
     if (project_info_desc_v2) \
@@ -112,9 +129,8 @@ uint8 get_secureboot_fuse_status(void)
     return secure_oem_config;
 }
 
-static ssize_t project_info_get(struct device *dev,
-                struct device_attribute *attr,
-                char *buf)
+static ssize_t project_info_get(struct kobject *kobj,
+    struct kobj_attribute *attr, char *buf)
 {
     if (project_info_desc_v1 || project_info_desc_v2) {
         if (attr == &dev_attr_project_name)
@@ -201,31 +217,52 @@ static struct attribute_group project_info_attr_group = {
     .attrs  = project_info_sysfs_entries,
 };
 
-static DEVICE_ATTR(ddr, 0444, component_info_get, NULL);
-static DEVICE_ATTR(emmc, 0444, component_info_get, NULL);
-static DEVICE_ATTR(f_camera, 0444, component_info_get, NULL);
-static DEVICE_ATTR(r_camera, 0444, component_info_get, NULL);
-static DEVICE_ATTR(second_r_camera, 0444, component_info_get, NULL);
-static DEVICE_ATTR(ois, 0444, component_info_get, NULL);
-static DEVICE_ATTR(tp, 0444, component_info_get, NULL);
-static DEVICE_ATTR(lcd, 0444, component_info_get, NULL);
-static DEVICE_ATTR(wcn, 0444, component_info_get, NULL);
-static DEVICE_ATTR(l_sensor, 0444, component_info_get, NULL);
-static DEVICE_ATTR(g_sensor, 0444, component_info_get, NULL);
-static DEVICE_ATTR(m_sensor, 0444, component_info_get, NULL);
-static DEVICE_ATTR(gyro, 0444, component_info_get, NULL);
-static DEVICE_ATTR(backlight, 0444, component_info_get, NULL);
-static DEVICE_ATTR(mainboard, 0444, component_info_get, NULL);
-static DEVICE_ATTR(fingerprints, 0444, component_info_get, NULL);
-static DEVICE_ATTR(touch_key, 0444, component_info_get, NULL);
-static DEVICE_ATTR(ufs, 0444, component_info_get, NULL);
-static DEVICE_ATTR(Aboard, 0444, component_info_get, NULL);
-static DEVICE_ATTR(nfc, 0444, component_info_get, NULL);
-static DEVICE_ATTR(fast_charge, 0444, component_info_get, NULL);
-static DEVICE_ATTR(cpu, 0444, component_info_get, NULL);
-static DEVICE_ATTR(rf_version, 0444, component_info_get, NULL);
-
-
+static struct kobj_attribute dev_attr_ddr =
+    __ATTR(ddr, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_emmc =
+    __ATTR(emmc, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_f_camera =
+    __ATTR(f_camera, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_r_camera =
+    __ATTR(r_camera, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_second_r_camera =
+    __ATTR(second_r_camera, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_ois =
+    __ATTR(ois, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_tp =
+    __ATTR(tp, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_lcd =
+    __ATTR(lcd, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_wcn =
+    __ATTR(wcn, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_l_sensor =
+    __ATTR(l_sensor, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_g_sensor =
+    __ATTR(g_sensor, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_m_sensor =
+    __ATTR(m_sensor, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_gyro =
+    __ATTR(gyro, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_backlight =
+    __ATTR(backlight, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_mainboard =
+    __ATTR(mainboard, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_fingerprints =
+    __ATTR(fingerprints, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_touch_key =
+    __ATTR(touch_key, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_ufs =
+    __ATTR(ufs, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_Aboard =
+    __ATTR(Aboard, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_nfc =
+    __ATTR(nfc, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_fast_charge =
+    __ATTR(fast_charge, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_cpu =
+    __ATTR(cpu, 0444, component_info_get, NULL);
+static struct kobj_attribute dev_attr_rf_version =
+    __ATTR(rf_version, 0444, component_info_get, NULL);
 char *get_component_version(enum COMPONENT_TYPE type)
 {
     if (type >= COMPONENT_MAX) {
@@ -300,9 +337,8 @@ static struct attribute_group component_info_attr_group = {
     .attrs  = component_info_sysfs_entries,
 };
 
-static ssize_t component_info_get(struct device *dev,
-                struct device_attribute *attr,
-                char *buf)
+static ssize_t component_info_get(struct kobject *kobj,
+    struct kobj_attribute *attr, char *buf)
 {
     if (attr == &dev_attr_ddr)
         return snprintf(buf, BUF_SIZE, "VER:\t%s\nMANU:\t%s\n",
