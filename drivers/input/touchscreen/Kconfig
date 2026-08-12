@@ -1356,6 +1356,16 @@ config TOUCHSCREEN_SYNAPTICS_S3320_I2C_RMI
 	help
 	  This enables support for Synaptics s1302 RMI over I2C based touch key.
 
+config TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
+	bool "Synaptics S3320 raw debug interfaces (DANGEROUS)"
+	depends on TOUCHSCREEN_SYNAPTICS_S3320_I2C_RMI
+	default n
+	help
+	  Enable the raw RMI character device and the touchpanel radd register
+	  interface. These interfaces allow direct touchscreen register access and
+	  must not be enabled in production kernels. If enabled for bring-up, they
+	  are restricted to privileged users and enforce bounded transfers.
+
 source "drivers/input/touchscreen/synaptics_tcm/Kconfig"
 
 source "drivers/input/touchscreen/focaltech_touch/Kconfig"

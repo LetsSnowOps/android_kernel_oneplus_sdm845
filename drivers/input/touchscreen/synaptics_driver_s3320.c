@@ -29,6 +29,9 @@
 #include <linux/interrupt.h>
 #include <linux/regulator/consumer.h>
 #include <linux/firmware.h>
+#include <linux/overflow.h>
+#include <linux/uidgid.h>
+#include <linux/capability.h>
 
 #include <linux/pinctrl/consumer.h>
 #include <linux/pinctrl/pinctrl.h>
@@ -61,7 +64,9 @@
 
 #include <linux/input/mt.h>
 
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
 #include "synaptics_redremote.h"
+#endif
 #include <linux/project_info.h>
 #include "synaptics_baseline.h"
 #include "synaptics_dsx_core.h"
@@ -120,9 +125,6 @@ struct fp_underscreen_info {
 
 #define PM_QOS_VALUE_TP 400
 struct pm_qos_request pm_qos_req_tp;
-
-/******************for Red function*****************/
-#define CONFIG_SYNAPTIC_RED
 
 /*********************for gesture*******************/
 #ifdef SUPPORT_GESTURE
@@ -197,7 +199,6 @@ struct pm_qos_request pm_qos_req_tp;
 #define KEY_GESTURE_SINGLE_TAP      KEY_F9
 
 int Enable_gesture =0;
-static int gesture_switch = 0;
 //ruanbanmao@BSP add for tp gesture 2015-05-06, end
 #endif
 
@@ -1084,21 +1085,31 @@ int synaptics_rmi4_i2c_write_block(
 {
 	int retval;
 	unsigned char retry;
-	unsigned char buf[2];
-	struct i2c_msg msg[] = {
-		{
-			.addr = client->addr,
-			.flags = 0,
-			.len = length + 1,
-			.buf = buf,
-		}
-	};
+	unsigned char *buf;
+	size_t transfer_len;
+	struct i2c_msg msg;
+
+	if (!data || !length)
+		return -EINVAL;
+
+	if (check_add_overflow((size_t)length, (size_t)1, &transfer_len) ||
+	    transfer_len > U16_MAX)
+		return -EINVAL;
+
+	buf = kmalloc(transfer_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	msg.addr = client->addr;
+	msg.flags = 0;
+	msg.len = transfer_len;
+	msg.buf = buf;
 
 	buf[0] = addr & 0xff;
-	memcpy(&buf[1], &data[0], length);
+	memcpy(&buf[1], data, length);
 
 	for (retry = 0; retry < 2; retry++) {
-		if (i2c_transfer(client->adapter, msg, 1) == 1) {
+		if (i2c_transfer(client->adapter, &msg, 1) == 1) {
 			retval = length;
 			break;
 		}
@@ -1110,6 +1121,7 @@ int synaptics_rmi4_i2c_write_block(
 	} else {
 		//rst_flag_counter = 0;
 	}
+	kfree(buf);
 	return retval;
 }
 
@@ -2046,69 +2058,6 @@ static ssize_t coordinate_proc_read_func(struct file *file, char __user *user_bu
 	return ret;
 }
 
-static ssize_t gesture_switch_read_func(struct file *file, char __user *user_buf, size_t count, loff_t *ppos)
-{
-	int ret = 0;
-	char page[PAGESIZE];
-	struct synaptics_ts_data *ts = ts_g;
-	if(!ts)
-		return ret;
-	ret = sprintf(page, "gesture_switch:%d\n", gesture_switch);
-	ret = simple_read_from_buffer(user_buf, count, ppos, page, strlen(page));
-	return ret;
-}
-
-static ssize_t gesture_switch_write_func(struct file *file, const char __user *page, size_t count, loff_t *ppos)
-{
-	int ret,write_flag=0;
-	char buf[10]={0};
-	struct synaptics_ts_data *ts = ts_g;
-
-	if(ts->loading_fw) {
-		TPD_ERR("%s FW is updating break!!\n",__func__);
-		return count;
-	}
-	if( copy_from_user(buf, page, count) ){
-		TPD_ERR("%s: read proc input error.\n", __func__);
-		return count;
-	}
-	__pm_stay_awake(ts->source);	//avoid system enter suspend lead to i2c error
-	mutex_lock(&ts->mutex);
-	ret = sscanf(buf,"%d",&write_flag);
-	gesture_switch = write_flag;
-	TPD_ERR("gesture_switch:%d,suspend:%d,gesture:%d\n",gesture_switch,ts->is_suspended,ts->gestures_enable);
-	if (1 == gesture_switch){
-		if ((ts->is_suspended == 1) && (ts->gestures_enable != 0)){
-			i2c_smbus_write_byte_data(ts->client, 0xff, 0x0);
-			synaptics_mode_change(0x80);
-			//synaptics_enable_interrupt_for_gesture(ts, 1);
-			//change active mode no need to write gesture mode.
-			touch_enable(ts);
-		}
-	}else if(2 == gesture_switch){
-		if ((ts->is_suspended == 1) && (ts->gestures_enable != 0)){
-			i2c_smbus_write_byte_data(ts->client, 0xff, 0x0);
-			synaptics_mode_change(0x81);
-			touch_disable(ts);
-			//synaptics_enable_interrupt_for_gesture(ts, 0);
-			//change slepp mode no need to write gesture mode.
-		}
-	}
-	mutex_unlock(&ts->mutex);
-	__pm_relax(ts->source);
-
-	return count;
-}
-
-// chenggang.li@BSP.TP modified for oem 2014-08-08 create node
-/******************************start****************************/
-static const struct file_operations gesture_switch_proc_fops = {
-	.write = gesture_switch_write_func,
-	.read =  gesture_switch_read_func,
-	.open = simple_open,
-	.owner = THIS_MODULE,
-};
-
 static const struct file_operations coordinate_proc_fops = {
 	.read =  coordinate_proc_read_func,
 	.open = simple_open,
@@ -2119,23 +2068,32 @@ static const struct file_operations coordinate_proc_fops = {
 #define GESTURE_ATTR(name, flag)\
 	static ssize_t name##_enable_read_func(struct file *file, char __user *user_buf, size_t count, loff_t *ppos)\
 	{\
-		int ret = 0;\
-		char page[PAGESIZE];\
-		ret = sprintf(page, "%d\n", (ts_g->gestures_enable & flag) != 0);\
-		ret = simple_read_from_buffer(user_buf, count, ppos, page, strlen(page));\
-		return ret;\
+		struct synaptics_ts_data *ts = READ_ONCE(ts_g);\
+		char page[4];\
+		int len;\
+		if (!ts)\
+			return -ENODEV;\
+		len = scnprintf(page, sizeof(page), "%d\n",\
+				(READ_ONCE(ts->gestures_enable) & flag) != 0);\
+		return simple_read_from_buffer(user_buf, count, ppos, page, len);\
 	}\
 	static ssize_t name##_enable_write_func(struct file *file, const char __user *user_buf, size_t count, loff_t *ppos)\
 	{\
-		int ret, write_flag = 0;\
-		char page[PAGESIZE] = {0};\
-		ret = copy_from_user(page, user_buf, count);\
-		ret = sscanf(page, "%d", &write_flag);\
-		if (write_flag) {\
-			ts_g->gestures_enable |= flag;\
+		struct synaptics_ts_data *ts = READ_ONCE(ts_g);\
+		bool enabled;\
+		int ret;\
+		if (!ts)\
+			return -ENODEV;\
+		ret = kstrtobool_from_user(user_buf, count, &enabled);\
+		if (ret)\
+			return ret;\
+		mutex_lock(&ts->mutex);\
+		if (enabled) {\
+			ts->gestures_enable |= flag;\
 		} else {\
-			ts_g->gestures_enable &= ~flag;\
+			ts->gestures_enable &= ~flag;\
 		}\
+		mutex_unlock(&ts->mutex);\
 		return count;\
 	}\
 	static const struct file_operations name##_enable_proc_fops = {\
@@ -2161,80 +2119,194 @@ GESTURE_ATTR(letter_w, GESTURE_W);
 GESTURE_ATTR(letter_m, GESTURE_M);
 GESTURE_ATTR(letter_s, GESTURE_S);
 
-static int page ,address,block;
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
+#define S3320_DEBUG_MAX_XFER	252
+#define S3320_RADD_HEADER_WORDS	4
+
+static u8 radd_page;
+static u8 radd_address;
+static u16 radd_block;
+
 static ssize_t synap_read_address(struct file *file, char __user *user_buf, size_t count, loff_t *ppos)
 {
-	int ret;
-	char buffer[PAGESIZE];
-	char buf[128];
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	size_t output_size;
+	char *output;
+	u8 *data;
+	u8 page;
+	u8 address;
+	u16 block;
 	int i;
-	int cnt = 0;
+	int len;
+	int ret;
 
-	struct synaptics_ts_data *ts = ts_g;
-	TPD_DEBUG("%s page=0x%x,address=0x%x,block=0x%x\n",__func__,page,address,block);
-	cnt += sprintf(&(buffer[cnt]), "page=0x%x,address=0x%x,block=0x%x\n",page,address,block);
-	ret = synaptics_rmi4_i2c_write_byte(ts->client,0xff,page);
-	ret = synaptics_rmi4_i2c_read_block(ts->client,address,block,buf);
-	for (i=0;i < block;i++)
-	{
-		cnt += sprintf(&(buffer[cnt]), "buf[%d]=0x%x\n",i,buf[i]);
-		TPD_DEBUG("buffer[%d]=0x%x\n",i,buffer[i]);
+	if (!ts)
+		return -ENODEV;
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+
+	mutex_lock(&ts->mutex);
+	page = radd_page;
+	address = radd_address;
+	block = radd_block;
+	mutex_unlock(&ts->mutex);
+
+	if (!block || block > S3320_DEBUG_MAX_XFER)
+		return -EINVAL;
+
+	if (check_mul_overflow((size_t)block, (size_t)24, &output_size) ||
+	    check_add_overflow(output_size, (size_t)64, &output_size))
+		return -EOVERFLOW;
+
+	data = kmalloc(block, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	output = kmalloc(output_size, GFP_KERNEL);
+	if (!output) {
+		kfree(data);
+		return -ENOMEM;
 	}
-	ret = simple_read_from_buffer(user_buf, count, ppos, buffer, strlen(buffer));
+
+	mutex_lock(&ts->mutex);
+	ret = synaptics_rmi4_i2c_write_byte(ts->client, 0xff, page);
+	if (ret >= 0)
+		ret = synaptics_rmi4_i2c_read_block(ts->client, address,
+						     block, data);
+	mutex_unlock(&ts->mutex);
+	if (ret != block) {
+		if (ret >= 0)
+			ret = -EIO;
+		goto out;
+	}
+
+	len = scnprintf(output, output_size,
+			"page=0x%x,address=0x%x,block=0x%x\n",
+			page, address, block);
+	for (i = 0; i < block; i++)
+		len += scnprintf(output + len, output_size - len,
+				 "buf[%d]=0x%x\n", i, data[i]);
+
+	ret = simple_read_from_buffer(user_buf, count, ppos, output, len);
+out:
+	kfree(output);
+	kfree(data);
 	return ret;
 }
 
 static ssize_t synap_write_address(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	int buf[128];
-	char buffer_local[128];
-	int ret, i;
-	struct synaptics_ts_data *ts = ts_g;
-	int temp_block, wbyte;
-	char reg[30];
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	u32 *values = NULL;
+	char *input = NULL;
+	char *cursor;
+	char *token;
+	u8 *reg = NULL;
+	u32 temp_block;
+	u32 wbyte;
+	size_t nr_values = 0;
+	size_t i;
+	int ret = 0;
 
-	if (count > 128)
-		return count;
-	if (copy_from_user(buffer_local, buffer, count)) {
-		TPD_ERR("%s: write proc error.\n", __func__);
-		return count;
+	if (!ts)
+		return -ENODEV;
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+	if (!count || count > PAGE_SIZE)
+		return -EINVAL;
+
+	input = memdup_user_nul(buffer, count);
+	if (IS_ERR(input))
+		return PTR_ERR(input);
+
+	values = kcalloc(S3320_RADD_HEADER_WORDS + S3320_DEBUG_MAX_XFER,
+			 sizeof(*values), GFP_KERNEL);
+	if (!values) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	ret = sscanf(buffer_local,
-	"%x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x",
-	&buf[0], &buf[1], &buf[2], &buf[3], &buf[4],
-	&buf[5], &buf[6], &buf[7], &buf[8], &buf[9],
-	&buf[10], &buf[11], &buf[12], &buf[13], &buf[14],
-	&buf[15], &buf[16], &buf[17]);
-    for (i = 0;i < ret;i++)
-    {
-        TPD_DEBUG("buf[i]=0x%x,",buf[i]);
-    }
-    TPD_DEBUG("\n");
-    page= buf[0];
-    address = buf[1];
-    temp_block = buf[2];
-    wbyte = buf[3];
-    if (0xFF == temp_block)//the  mark is to write register else read register
-    {
-        for (i=0;i < wbyte;i++)
-        {
-            reg[i] = (char)buf[4+i];
-        }
-        ret = synaptics_rmi4_i2c_write_byte(ts->client,0xff,page);
-        ret = synaptics_rmi4_i2c_write_block(ts->client,(char)address,wbyte,reg);
-        TPD_DEBUG("%s write page=0x%x,address=0x%x\n",__func__,page,address);
-        for (i=0;i < wbyte;i++)
-        {
-            TPD_DEBUG("reg=0x%x\n",reg[i]);
-        }
-    }
-    else {
-        block = temp_block;
-    }
+	cursor = input;
+	while ((token = strsep(&cursor, " \t\r\n")) != NULL) {
+		if (!*token)
+			continue;
+		if (nr_values >= S3320_RADD_HEADER_WORDS +
+				 S3320_DEBUG_MAX_XFER) {
+			ret = -E2BIG;
+			goto out;
+		}
+		ret = kstrtou32(token, 16, &values[nr_values]);
+		if (ret)
+			goto out;
+		nr_values++;
+	}
 
-	return count;
+	if (nr_values < 3 || values[0] > U8_MAX || values[1] > U8_MAX) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	temp_block = values[2];
+	if (temp_block == 0xff) {
+		if (nr_values < S3320_RADD_HEADER_WORDS) {
+			ret = -EINVAL;
+			goto out;
+		}
+		wbyte = values[3];
+		if (!wbyte || wbyte > S3320_DEBUG_MAX_XFER ||
+		    nr_values != S3320_RADD_HEADER_WORDS + wbyte) {
+			ret = -EINVAL;
+			goto out;
+		}
+		reg = kmalloc(wbyte, GFP_KERNEL);
+		if (!reg) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		for (i = 0; i < wbyte; i++) {
+			if (values[S3320_RADD_HEADER_WORDS + i] > U8_MAX) {
+				ret = -ERANGE;
+				goto out;
+			}
+			reg[i] = values[S3320_RADD_HEADER_WORDS + i];
+		}
+
+		mutex_lock(&ts->mutex);
+		ret = synaptics_rmi4_i2c_write_byte(ts->client, 0xff,
+						  values[0]);
+		if (ret >= 0)
+			ret = synaptics_rmi4_i2c_write_block(ts->client,
+					values[1], wbyte, reg);
+		if (ret == wbyte) {
+			radd_page = values[0];
+			radd_address = values[1];
+		}
+		mutex_unlock(&ts->mutex);
+		if (ret != wbyte) {
+			if (ret >= 0)
+				ret = -EIO;
+			goto out;
+		}
+	} else {
+		if (nr_values != 3 || !temp_block ||
+		    temp_block > S3320_DEBUG_MAX_XFER) {
+			ret = -EINVAL;
+			goto out;
+		}
+		mutex_lock(&ts->mutex);
+		radd_page = values[0];
+		radd_address = values[1];
+		radd_block = temp_block;
+		mutex_unlock(&ts->mutex);
+	}
+
+	ret = count;
+out:
+	kfree(reg);
+	kfree(values);
+	kfree(input);
+	return ret;
 }
+#endif /* CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG */
 
 #ifdef SUPPORT_GLOVES_MODE
 static ssize_t tp_glove_read_func(struct file *file, char __user *user_buf, size_t count, loff_t *ppos)
@@ -2252,35 +2324,20 @@ static ssize_t tp_glove_read_func(struct file *file, char __user *user_buf, size
 
 static ssize_t tp_glove_write_func(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	struct synaptics_ts_data *ts= ts_g;
-	int ret = 0 ;
-	char buf[10]={0};
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	bool enabled;
+	int ret;
 
-	if( count > 10 )
-		goto GLOVE_ENABLE_END;
-	if( copy_from_user( buf, buffer, count) ){
-		TPD_ERR("%s: read proc input error.\n", __func__);
-		goto GLOVE_ENABLE_END;
-	}
-	sscanf(buf, "%d", &ret);
-	if(!ts)
-		return count;
-	TPDTM_DMESG("tp_glove_write_func:buf = %d,ret = %d\n", *buf, ret);
-	if( (ret == 0 ) || (ret == 1) ){
-		ts->glove_enable = ret;
-		synaptics_glove_mode_enable(ts);
-	}
-	switch(ret){
-		case 0:
-			TPDTM_DMESG("tp_glove_func will be disable\n");
-			break;
-		case 1:
-			TPDTM_DMESG("tp_glove_func will be enable\n");
-			break;
-		default:
-			TPDTM_DMESG("Please enter 0 or 1 to open or close the glove function\n");
-	}
-GLOVE_ENABLE_END:
+	if (!ts)
+		return -ENODEV;
+	ret = kstrtobool_from_user(buffer, count, &enabled);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ts->mutex);
+	ts->glove_enable = enabled;
+	synaptics_glove_mode_enable(ts);
+	mutex_unlock(&ts->mutex);
 	return count;
 }
 #endif
@@ -2297,35 +2354,23 @@ static ssize_t tp_sleep_read_func(struct file *file, char __user *user_buf, size
 	return ret;
 }
 
-static ssize_t tp_sleep_write_func(struct file *file, const char *buffer, size_t count, loff_t *ppos)
+static ssize_t tp_sleep_write_func(struct file *file,
+		const char __user *buffer, size_t count, loff_t *ppos)
 {
-	char buf[10]={0};
-	struct synaptics_ts_data *ts = ts_g;
-	int ret = 0 ;
-	if( count > 10 )
-		return count;
-	if(!ts)
-		return count;
-	if( copy_from_user( buf, buffer, count) ) {
-		TPD_ERR(KERN_INFO "%s: read proc input error.\n", __func__);
-		return count;
-	}
-	sscanf(buf, "%d", &ret);
-	TPDTM_DMESG("tp_sleep_write_func:buf = %d,ret = %d\n", *buf, ret);
-	if( (ret == 0 ) || (ret == 1) ) {
-		sleep_enable = ret;
-		synaptics_sleep_mode_enable(ts);
-	}
-	switch(ret) {
-		case 0:
-			TPDTM_DMESG("tp_sleep_func will be disable\n");
-			break;
-		case 1:
-			TPDTM_DMESG("tp_sleep_func will be enable\n");
-			break;
-		default:
-			TPDTM_DMESG("Please enter 0 or 1 to open or close the sleep function\n");
-	}
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	bool enabled;
+	int ret;
+
+	if (!ts)
+		return -ENODEV;
+	ret = kstrtobool_from_user(buffer, count, &enabled);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ts->mutex);
+	sleep_enable = enabled;
+	synaptics_sleep_mode_enable(ts);
+	mutex_unlock(&ts->mutex);
 	return count;
 }
 #endif
@@ -4112,26 +4157,16 @@ static DEVICE_ATTR(tp_gesture_touch_hold, 0664,
 static int synaptics_dsx_pinctrl_init(struct synaptics_ts_data *ts);
 
 static ssize_t tp_debug_log_write_func(
-	struct file *file, const char *buffer,
+	struct file *file, const char __user *buffer,
 	size_t count, loff_t *ppos)
 {
-	int ret, tmp = 0;
-	char buf[4] = {0};
+	int ret;
+	int tmp;
 
-	if (count > 4)
-		return count;
-	if (copy_from_user(buf, buffer, count)) {
-		TPD_ERR(KERN_INFO "%s: read proc input error.\n", __func__);
-		return count;
-	}
-
-	ret = kstrtoint(buf, 10, &tmp);
-	if (ret >= 0) {
-		tp_debug = tmp;
-	} else {
-	TPDTM_DMESG("invalid content: '%s', length = %zd\n",
-	buf, count);
-	}
+	ret = kstrtoint_from_user(buffer, count, 10, &tmp);
+	if (ret)
+		return ret;
+	tp_debug = tmp;
 	return count;
 }
 
@@ -4207,25 +4242,21 @@ static const struct file_operations tp_main_reg_proc_fops = {
 };
 
 
-static ssize_t tp_reset_write_func (struct file *file, const char *buffer, size_t count, loff_t *ppos)
+static ssize_t tp_reset_write_func(struct file *file,
+		const char __user *buffer, size_t count, loff_t *ppos)
 {
 	int ret, write_flag, i;
-	char buf[10] = {0};
-	struct synaptics_ts_data *ts = ts_g;
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
 
-	if (count > 10)
-		return count;
 	if (!ts)
-		return count;
+		return -ENODEV;
 	if (ts->loading_fw) {
 		TPD_ERR("%s FW is updating break!!\n", __func__);
-		return count;
+		return -EBUSY;
 	}
-	if (copy_from_user(buf, buffer, count)) {
-		TPD_ERR(KERN_INFO "%s: read proc input error.\n", __func__);
-		return count;
-	}
-	ret = sscanf(buf, "%d", &write_flag);
+	ret = kstrtoint_from_user(buffer, count, 10, &write_flag);
+	if (ret)
+		return ret;
 
 	TPD_ERR("%s write [%d]\n",__func__,write_flag);
 	if (1 == write_flag)
@@ -4275,12 +4306,14 @@ static ssize_t tp_reset_write_func (struct file *file, const char *buffer, size_
 }
 
 //chenggang.li@bsp add for 14045
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
 static const struct file_operations radd_proc_fops = {
 	.write = synap_write_address,
 	.read =  synap_read_address,
 	.open = simple_open,
 	.owner = THIS_MODULE,
 };
+#endif
 
 
 //wangwenxue@BSP add for change baseline_test to "proc\touchpanel\baseline_test"  begin
@@ -4351,28 +4384,19 @@ static ssize_t changer_read_func(struct file *file, char __user *user_buf, size_
 
 static ssize_t changer_write_func(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	struct synaptics_ts_data *ts= ts_g;
-	int ret = 0 ;
-	char buf[4] = {0};
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	bool connected;
+	int ret;
 
-	if (count > 2)
-		return count;
-
-	if (copy_from_user(buf, buffer, count)) {
-		TPD_ERR(KERN_INFO "%s: write proc input error.\n", __func__);
-		return count;
-	}
-
-	if (-1 == sscanf(buf, "%d", &ret)) {
-		TPD_ERR("%s sscanf error\n", __func__);
-		return count;
-	}
-	if(!ts)
-		return count;
-	if( (ret == 0 ) || (ret == 1) ){
-		ts->changer_connet = ret;
-        ret = set_changer_bit(ts);
-	}
+	if (!ts)
+		return -ENODEV;
+	ret = kstrtobool_from_user(buffer, count, &connected);
+	if (ret)
+		return ret;
+	ts->changer_connet = connected;
+	ret = set_changer_bit(ts);
+	if (ret < 0)
+		return ret;
 	TPDTM_DMESG("%s:ts->changer_connet = %d\n",__func__,ts->changer_connet);
 	return count;
 }
@@ -4594,29 +4618,22 @@ static ssize_t touch_press_status_read(struct file *file, char __user *user_buf,
 
 static ssize_t touch_press_status_write(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	struct synaptics_ts_data *ts= ts_g;
-	int ret = 0 ;
-	char buf[4] = {0};
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	int command;
+	int ret;
 
-	if (count > 2)
-		return count;
+	if (!ts)
+		return -ENODEV;
+	ret = kstrtoint_from_user(buffer, count, 10, &command);
+	if (ret)
+		return ret;
+	if (command != 0 && command != 1)
+		return -EINVAL;
 
-	if (copy_from_user(buf, buffer, count)) {
-		TPD_ERR("%s write error\n", __func__);
-		return count;
-	}
-	if (-1 == sscanf(buf, "%d", &ret)) {
-		TPD_ERR("%s sscanf error\n", __func__);
-		return count;
-	}
-	if(!ts)
-		return count;
-
-	TPD_ERR("%s write %d\n",__func__,ret);
-	if (ret == 0){
+	TPD_ERR("%s write %d\n", __func__, command);
+	if (command == 0) {
 		tp_baseline_get(ts,false);
-	}
-	else if(ret == 1) {
+	} else {
 		if (0 == ts->gestures_enable)
 			queue_delayed_work(get_base_report, &ts->base_work,msecs_to_jiffies(120));
 		else
@@ -4645,9 +4662,9 @@ static ssize_t limit_enable_read(struct file *file, char __user *user_buf, size_
 
 static ssize_t limit_enable_write(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-        int ret;
-	char buf[8]={0};
-        int limit_mode = 0;
+	bool enabled;
+	int limit_mode = 0;
+	int ret;
 
 	if (version_is_s3508 == 2) {
 		F51_GRIP_CONFIGURATION = F51_CUSTOM_CTRL_BASE+0x0a;
@@ -4658,24 +4675,14 @@ static ssize_t limit_enable_write(struct file *file, const char __user *buffer, 
 	} else
 		F51_GRIP_CONFIGURATION = F51_CUSTOM_CTRL_BASE+0x0a;
 
-	if( count > 2)
-		count = 2;
-	if(ts_g == NULL)
-	{
+	if (ts_g == NULL) {
 		TPD_ERR("ts_g is NULL!\n");
-		return -1;
+		return -ENODEV;
 	}
-	if(copy_from_user(buf, buffer, count))
-	{
-		TPD_DEBUG("%s: read proc input error.\n", __func__);
-		return count;
-	}
-
-	if('0' == buf[0]){
-		limit_enable = 0;
-	}else if('1' == buf[0]){
-		limit_enable = 1;
-	}
+	ret = kstrtobool_from_user(buffer, count, &enabled);
+	if (ret)
+		return ret;
+	limit_enable = enabled;
 	msleep(30);
 	mutex_lock(&ts_g->mutex);
 	ret = i2c_smbus_write_byte_data(ts_g->client, 0xff, 0x4);
@@ -4732,18 +4739,16 @@ static ssize_t key_switch_read_func(struct file *file, char __user *user_buf, si
 
 static ssize_t key_switch_write_func(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	char buf[4] = {0};
-	struct synaptics_ts_data *ts = ts_g;
-	if(!ts)
-		return count;
-	if(count > 2)
-		return count;
-	if(copy_from_user(buf, buffer, count))
-	{
-		TPD_ERR("%s copy error\n", __func__);
-		return count;
-	}
-	sscanf(&buf[0], "%d", &key_switch);
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	bool enabled;
+	int ret;
+
+	if (!ts)
+		return -ENODEV;
+	ret = kstrtobool_from_user(buffer, count, &enabled);
+	if (ret)
+		return ret;
+	key_switch = enabled;
 	TPD_ERR("%s write [%d]\n", __func__, key_switch);
 	TPD_ERR("left:%s right:%s\n", key_switch?"key_back":"key_appselect",
 		key_switch?"key_appselect":"key_back");
@@ -4771,32 +4776,33 @@ static ssize_t key_disable_read_func(struct file *file, char __user *user_buf, s
 
 static ssize_t key_disable_write_func(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	char buf[PAGESIZE];
-	struct synaptics_ts_data *ts = ts_g;
-	if(!ts)
-		return count;
-	if( count > sizeof(buf)){
-		TPD_ERR("%s error\n",__func__);
-		return count;
-	}
+	struct synaptics_ts_data *ts = READ_ONCE(ts_g);
+	char *command;
+	char *value;
+	int ret = count;
 
-	if(copy_from_user(buf, buffer, count))
-	{
-		TPD_ERR("%s copy error\n", __func__);
-		return count;
-	}
-	if (NULL != strstr(buf,"disable"))
-	{
-		key_back_disable =true;
+	if (!ts)
+		return -ENODEV;
+	if (!count || count > 16)
+		return -EINVAL;
+	command = memdup_user_nul(buffer, count);
+	if (IS_ERR(command))
+		return PTR_ERR(command);
+	value = strim(command);
+
+	if (!strcmp(value, "disable")) {
+		key_back_disable = true;
 		key_appselect_disable = true;
-	}
-	else if (NULL != strstr(buf,"enable"))
-	{
-		key_back_disable =false;
+	} else if (!strcmp(value, "enable")) {
+		key_back_disable = false;
 		key_appselect_disable = false;
+	} else {
+		ret = -EINVAL;
 	}
-	TPD_ERR("%s key_back:%d key_appselect:%d\n",__func__,key_back_disable,key_appselect_disable);
-	return count;
+	TPD_ERR("%s key_back:%d key_appselect:%d\n", __func__,
+		key_back_disable, key_appselect_disable);
+	kfree(command);
+	return ret;
 }
 
 static const struct file_operations key_disable_proc_fops = {
@@ -4807,15 +4813,22 @@ static const struct file_operations key_disable_proc_fops = {
 };
 #endif
 
-#define CREATE_PROC_NODE(PARENT, NAME, MODE)\
-	node = proc_create(#NAME, MODE, PARENT, &NAME##_proc_fops);\
-	if (node == NULL) {\
-		ret = -ENOMEM;\
-		TPD_ERR("Couldn't create " #NAME " in " #PARENT "\n");\
-	}
+#define TOUCHPANEL_PROC_MODE(MODE) \
+	(((MODE) & 0222) ? ((MODE) & 0660) : (MODE))
 
-#define CREATE_GESTURE_NODE(NAME)\
-	CREATE_PROC_NODE(touchpanel, NAME##_enable, 0666)
+#define CREATE_PROC_NODE(PARENT, NAME, MODE) do { \
+	node = proc_create(#NAME, TOUCHPANEL_PROC_MODE(MODE), PARENT, \
+			&NAME##_proc_fops); \
+	if (node == NULL) { \
+		ret = -ENOMEM; \
+		TPD_ERR("Couldn't create " #NAME " in " #PARENT "\n"); \
+	} else { \
+		proc_set_user(node, GLOBAL_ROOT_UID, KGIDT_INIT(1000)); \
+	} \
+} while (0)
+
+#define CREATE_GESTURE_NODE(NAME) \
+	CREATE_PROC_NODE(touchpanel, NAME##_enable, 0660)
 
 static int init_synaptics_proc(struct synaptics_ts_data *ts)
 {
@@ -4870,7 +4883,9 @@ static int init_synaptics_proc(struct synaptics_ts_data *ts)
 
 	CREATE_PROC_NODE(touchpanel, baseline_test, 0666);
 	CREATE_PROC_NODE(touchpanel, i2c_device_test, 0666);
-	CREATE_PROC_NODE(touchpanel, radd, 0777);
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
+	CREATE_PROC_NODE(touchpanel, radd, 0600);
+#endif
 	CREATE_PROC_NODE(touchpanel, vendor_id, 0444);
 	CREATE_PROC_NODE(touchpanel, changer_connet, 0666);
 	CREATE_PROC_NODE(touchpanel, touch_press, 0666);
@@ -5750,7 +5765,7 @@ static int synaptics_ts_init_virtual_key(struct synaptics_ts_data *ts )
 
 static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
-#ifdef CONFIG_SYNAPTIC_RED
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
 	struct remotepanel_data *premote_data = NULL;
 #endif
 	struct synaptics_ts_data *ts = NULL;
@@ -6035,7 +6050,7 @@ static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device
 #ifdef SUPPORT_VIRTUAL_KEY
 	synaptics_ts_init_virtual_key(ts);
 #endif
-#ifdef CONFIG_SYNAPTIC_RED
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
 	premote_data = remote_alloc_panel_data();
 	if(premote_data) {
 		premote_data->client 		= client;
@@ -6097,7 +6112,7 @@ static int synaptics_ts_remove(struct i2c_client *client)
 	struct synaptics_ts_data *ts = i2c_get_clientdata(client);
 
 	TPD_ERR("%s is called\n",__func__);
-#ifdef CONFIG_SYNAPTIC_RED
+#ifdef CONFIG_TOUCHSCREEN_SYNAPTICS_S3320_DEBUG
 	unregister_remote_device();
 #endif
 

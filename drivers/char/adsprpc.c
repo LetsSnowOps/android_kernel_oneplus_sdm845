@@ -40,6 +40,7 @@
 #include <linux/pm_qos.h>
 #include <linux/stat.h>
 #include <linux/cpumask.h>
+#include <linux/overflow.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/fastrpc.h>
@@ -1734,10 +1735,85 @@ static void fastrpc_file_list_dtor(struct fastrpc_apps *me)
 	} while (free);
 }
 
+struct fastrpc_invoke_layout {
+	size_t list_offset;
+	size_t pages_offset;
+	size_t fdlist_offset;
+	size_t crclist_offset;
+	size_t early_hint_offset;
+	size_t metadata_size;
+};
+
+static int fastrpc_layout_add(size_t *offset, size_t count,
+			      size_t element_size)
+{
+	size_t bytes;
+
+	if (check_mul_overflow(count, element_size, &bytes) ||
+	    check_add_overflow(*offset, bytes, offset))
+		return -EOVERFLOW;
+
+	return 0;
+}
+
+static int fastrpc_get_invoke_layout(uint32_t sc,
+				    struct fastrpc_invoke_layout *layout)
+{
+	size_t count = REMOTE_SCALARS_LENGTH(sc);
+	size_t offset = 0;
+	int err;
+
+	err = fastrpc_layout_add(&offset, count, sizeof(remote_arg64_t));
+	if (err)
+		return err;
+	layout->list_offset = offset;
+
+	err = fastrpc_layout_add(&offset, count,
+				 sizeof(struct smq_invoke_buf));
+	if (err)
+		return err;
+	layout->pages_offset = offset;
+
+	err = fastrpc_layout_add(&offset, count,
+				 sizeof(struct smq_phy_page));
+	if (err)
+		return err;
+	layout->fdlist_offset = offset;
+
+	err = fastrpc_layout_add(&offset, M_FDLIST, sizeof(uint64_t));
+	if (err)
+		return err;
+	layout->crclist_offset = offset;
+
+	err = fastrpc_layout_add(&offset, M_CRCLIST, sizeof(uint32_t));
+	if (err)
+		return err;
+	layout->early_hint_offset = offset;
+
+	err = fastrpc_layout_add(&offset, 1, sizeof(uint32_t));
+	if (err)
+		return err;
+	layout->metadata_size = offset;
+
+	return 0;
+}
+
+static int fastrpc_align_copylen(size_t *copylen)
+{
+	size_t aligned;
+
+	if (check_add_overflow(*copylen, (size_t)BALIGN - 1, &aligned))
+		return -EOVERFLOW;
+
+	*copylen = aligned & ~((size_t)BALIGN - 1);
+	return 0;
+}
+
 static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 {
 	remote_arg64_t *rpra, *lrpra;
 	remote_arg_t *lpra = ctx->lpra;
+	struct fastrpc_invoke_layout layout;
 	struct smq_invoke_buf *list;
 	struct smq_phy_page *pages, *ipage;
 	uint32_t sc = ctx->sc;
@@ -1749,20 +1825,24 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	int i, oix;
 	int err = 0, j = 0;
 	int mflags = 0;
-	uint64_t *fdlist;
-	uint32_t *crclist;
-	uint32_t earlyHint;
 	int64_t *perf_counter = NULL;
 
 	if (ctx->fl->profile)
 		perf_counter = getperfcounter(ctx->fl, PERF_COUNT);
 
-	/* calculate size of the metadata */
+	/* Calculate and validate the complete metadata layout up front. */
+	err = fastrpc_get_invoke_layout(sc, &layout);
+	if (err)
+		goto bail;
+	metalen = copylen = layout.metadata_size;
+	lrpralen = layout.list_offset;
+	if (!metalen || metalen >= gfa.max_size_limit) {
+		err = -E2BIG;
+		goto bail;
+	}
+
 	rpra = NULL;
 	lrpra = NULL;
-	list = smq_invoke_buf_start(rpra, sc);
-	pages = smq_phy_page_start(sc, list);
-	ipage = pages;
 
 	PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_MAP),
 	for (i = 0; i < bufs; ++i) {
@@ -1779,7 +1859,6 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		mutex_unlock(&ctx->fl->map_mutex);
 		if (err)
 			goto bail;
-		ipage += 1;
 	}
 	PERF_END);
 	handles = REMOTE_SCALARS_INHANDLES(sc) + REMOTE_SCALARS_OUTHANDLES(sc);
@@ -1806,16 +1885,10 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			mutex_unlock(&ctx->fl->map_mutex);
 			goto bail;
 		}
-		ipage += 1;
 	}
 	mutex_unlock(&ctx->fl->map_mutex);
 
-	/* metalen includes meta data, fds, crc and early wakeup hint */
-	metalen = copylen = (size_t)&ipage[0] + (sizeof(uint64_t) * M_FDLIST) +
-			(sizeof(uint32_t) * M_CRCLIST) + sizeof(earlyHint);
-
 	/* allocate new local rpra buffer */
-	lrpralen = (size_t)&list[0];
 	if (lrpralen) {
 		lrpra = kzalloc(lrpralen, GFP_KERNEL);
 		VERIFY(err, !IS_ERR_OR_NULL(lrpra));
@@ -1834,14 +1907,30 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			continue;
 		if (ctx->maps[i])
 			continue;
-		if (ctx->overps[oix]->offset == 0)
-			copylen = ALIGN(copylen, BALIGN);
+		if (ctx->overps[oix]->offset == 0) {
+			err = fastrpc_align_copylen(&copylen);
+			if (err)
+				goto bail;
+		}
 		mstart = ctx->overps[oix]->mstart;
 		mend = ctx->overps[oix]->mend;
-		VERIFY(err, (mend - mstart) <= LONG_MAX);
-		if (err)
+		if (mend < mstart || mend - mstart > LONG_MAX) {
+			err = -EOVERFLOW;
 			goto bail;
-		copylen += mend - mstart;
+		}
+		if (check_add_overflow(copylen, (size_t)(mend - mstart),
+				       &copylen)) {
+			err = -EOVERFLOW;
+			goto bail;
+		}
+		if (copylen >= gfa.max_size_limit) {
+			err = -E2BIG;
+			goto bail;
+		}
+	}
+	if (copylen < metalen) {
+		err = -EOVERFLOW;
+		goto bail;
 	}
 	ctx->used = copylen;
 
@@ -1851,16 +1940,25 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		if (err)
 			goto bail;
 	}
-	if (ctx->buf->virt && metalen <= copylen)
-		memset(ctx->buf->virt, 0, metalen);
+	if (!ctx->buf || !ctx->buf->virt || ctx->buf->size < copylen) {
+		err = -EFAULT;
+		goto bail;
+	}
+	memset(ctx->buf->virt, 0, metalen);
 
 	/* copy metadata */
 	rpra = ctx->buf->virt;
 	ctx->rpra = rpra;
-	list = smq_invoke_buf_start(rpra, sc);
-	pages = smq_phy_page_start(sc, list);
+	list = (struct smq_invoke_buf *)((uint8_t *)rpra +
+						 layout.list_offset);
+	pages = (struct smq_phy_page *)((uint8_t *)rpra +
+						layout.pages_offset);
 	ipage = pages;
-	args = (uintptr_t)ctx->buf->virt + metalen;
+	if (check_add_overflow((uintptr_t)ctx->buf->virt,
+			       (uintptr_t)metalen, &args)) {
+		err = -EOVERFLOW;
+		goto bail;
+	}
 	for (i = 0; i < bufs + handles; ++i) {
 		if (lpra[i].buf.len)
 			list[i].num = 1;
@@ -1937,13 +2035,6 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		}
 	}
 	mutex_unlock(&ctx->fl->map_mutex);
-	fdlist = (uint64_t *)&pages[bufs + handles];
-	crclist = (uint32_t *)&fdlist[M_FDLIST];
-	/* reset fds, crc and early wakeup hint memory */
-	/* remote process updates these values before responding */
-	memset(fdlist, 0, sizeof(uint64_t)*M_FDLIST +
-			sizeof(uint32_t)*M_CRCLIST + sizeof(earlyHint));
-
 	/* copy non ion buffers */
 	PERF(ctx->fl->profile, GET_COUNTER(perf_counter, PERF_COPY),
 	rlen = copylen - metalen;
@@ -1959,8 +2050,22 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		if (map)
 			continue;
 		if (ctx->overps[oix]->offset == 0) {
-			rlen -= ALIGN(args, BALIGN) - args;
-			args = ALIGN(args, BALIGN);
+			uintptr_t aligned_args;
+			size_t padding;
+
+			if (check_add_overflow(args, (uintptr_t)BALIGN - 1,
+					       &aligned_args)) {
+				err = -EOVERFLOW;
+				goto bail;
+			}
+			aligned_args &= ~((uintptr_t)BALIGN - 1);
+			padding = aligned_args - args;
+			if (padding > rlen) {
+				err = -EOVERFLOW;
+				goto bail;
+			}
+			rlen -= padding;
+			args = aligned_args;
 		}
 		mlen = ctx->overps[oix]->mend - ctx->overps[oix]->mstart;
 		VERIFY(err, rlen >= mlen);
@@ -1981,7 +2086,10 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			if (err)
 				goto bail;
 		}
-		args = args + mlen;
+		if (check_add_overflow(args, (uintptr_t)mlen, &args)) {
+			err = -EOVERFLOW;
+			goto bail;
+		}
 		rlen -= mlen;
 	}
 	PERF_END);
